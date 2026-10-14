@@ -1,0 +1,9 @@
+# Use this workspace to collaborate
+workspace:
+  id: f1a2524c-1851-42f9-892d-c9d73fc76068
+
+localResources:
+  collections:
+    - ../docs/Support Tickets API
+  specs:
+    - ../docs/openapi.yaml

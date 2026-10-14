@@ -1,0 +1,12 @@
+$kind: http-request
+url: "{{baseUrl}}/tickets/{{ticketId}}"
+method: PATCH
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "status": "IN_PROGRESS"
+    }
+order: 4000

@@ -1,0 +1,4 @@
+-r src/requirements.txt
+moto[dynamodb,s3,sqs]==5.0.28
+pytest==8.3.4
+requests==2.32.3

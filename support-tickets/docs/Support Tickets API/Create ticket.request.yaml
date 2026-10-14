@@ -1,0 +1,20 @@
+$kind: http-request
+url: "{{baseUrl}}/tickets"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "title": "Printer broken",
+      "description": "Paper jam",
+      "priority": "HIGH"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test("201",()=>pm.response.to.have.status(201));
+      pm.collectionVariables.set("ticketId", pm.response.json().ticketId);
+    language: text/javascript
+order: 1000

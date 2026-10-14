@@ -1,0 +1,13 @@
+$kind: collection
+description: ""
+variables:
+  baseUrl: ""
+  idToken: ""
+  ticketId: ""
+  reportId: ""
+auth:
+  - id: 9b775d4f-a6f7-481a-a34c-e9c9269889a6
+    type: bearer
+    name: bearer auth
+    credentials:
+      token: "{{idToken}}"

@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Support tickets API with asynchronous CSV reports (API GW + Lambda + DynamoDB + SQS + S3 + Cognito)
+
+Parameters:
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  PresignTtlSeconds:
+    Type: Number
+    Default: 300
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: SQS deliveries before a report job goes to the DLQ (also used by the worker to mark FAILED)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 256
+    Timeout: 10
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref AppTable
+        REPORT_QUEUE_URL: !Ref ReportQueue
+        REPORT_BUCKET: !Ref ReportBucket
+        PRESIGN_TTL_SECONDS: !Ref PresignTtlSeconds
+        MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
+
+Resources:
+  # ---------------------------------------------------------------- Auth
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  # ---------------------------------------------------------------- API
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","routeKey":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","authorizerError":"$context.authorizer.error"}'
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- Data
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gsi1pk, AttributeType: S}
+        - {AttributeName: gsi1sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: gsi1pk, KeyType: HASH}
+            - {AttributeName: gsi1sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ReportDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ReportQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180        # >= 6x worker timeout (30s), AWS recommendation
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportDlq.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-reports, Status: Enabled, Prefix: reports/, ExpirationInDays: 30}
+
+  ReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt ReportBucket.Arn, !Sub '${ReportBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  # ---------------------------------------------------------------- Functions
+  TicketsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.tickets.lambda_handler
+      LoggingConfig: {LogGroup: !Ref TicketsLogs}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query]
+              Resource: [!GetAtt AppTable.Arn, !Sub '${AppTable.Arn}/index/GSI1']
+      Events:
+        Create: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: POST, Path: /tickets}}
+        List: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: GET, Path: /tickets}}
+        Get: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: GET, Path: '/tickets/{ticketId}'}}
+        Patch: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: PATCH, Path: '/tickets/{ticketId}'}}
+        Delete: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: DELETE, Path: '/tickets/{ticketId}'}}
+
+  ReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.reports.lambda_handler
+      LoggingConfig: {LogGroup: !Ref ReportsLogs}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt AppTable.Arn
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt ReportQueue.Arn
+            - Effect: Allow   # needed so presigned GET URLs signed by this role are accepted
+              Action: s3:GetObject
+              Resource: !Sub '${ReportBucket.Arn}/reports/*'
+      Events:
+        Create: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: POST, Path: /reports}}
+        Get: {Type: HttpApi, Properties: {ApiId: !Ref HttpApi, Method: GET, Path: '/reports/{reportId}'}}
+
+  ReportWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handlers.report_worker.lambda_handler
+      Timeout: 30
+      MemorySize: 512
+      LoggingConfig: {LogGroup: !Ref WorkerLogs}
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:Query]
+              Resource: [!GetAtt AppTable.Arn, !Sub '${AppTable.Arn}/index/GSI1']
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ReportBucket.Arn}/reports/*'
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReportQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  TicketsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: !Ref LogRetentionDays}
+  ReportsLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: !Ref LogRetentionDays}
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: !Ref LogRetentionDays}
+
+  # ---------------------------------------------------------------- Operations
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Report jobs are in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt ReportDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ReportQueueUrl:
+    Value: !Ref ReportQueue
+  ReportDlqUrl:
+    Value: !Ref ReportDlq
+  ReportBucketName:
+    Value: !Ref ReportBucket
+  TableName:
+    Value: !Ref AppTable

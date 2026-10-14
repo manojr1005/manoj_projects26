@@ -1,0 +1,104 @@
+openapi: 3.0.3
+info: {title: Support Tickets API, version: 1.0.0}
+servers: [{url: 'https://{apiId}.execute-api.{region}.amazonaws.com', variables: {apiId: {default: abc123}, region: {default: us-east-1}}}]
+security: [{bearerAuth: []}]
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT, description: Cognito ID token}
+  schemas:
+    Priority: {type: string, enum: [LOW, MEDIUM, HIGH]}
+    Status: {type: string, enum: [OPEN, IN_PROGRESS, CLOSED]}
+    Ticket:
+      type: object
+      properties:
+        ticketId: {type: string}
+        title: {type: string, maxLength: 200}
+        description: {type: string, maxLength: 5000}
+        priority: {$ref: '#/components/schemas/Priority'}
+        status: {$ref: '#/components/schemas/Status'}
+        createdBy: {type: string, description: Cognito sub from the JWT}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+    Report:
+      type: object
+      properties:
+        reportId: {type: string}
+        status: {type: string, enum: [QUEUED, PROCESSING, COMPLETED, FAILED]}
+        statusFilter: {$ref: '#/components/schemas/Status'}
+        createdAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        completedAt: {type: string, format: date-time}
+        ticketCount: {type: integer}
+        errorMessage: {type: string}
+        downloadUrl: {type: string, description: Presigned S3 URL, only when COMPLETED}
+        downloadUrlExpiresInSeconds: {type: integer}
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: {type: string, enum: [VALIDATION_ERROR, UNAUTHORIZED, NOT_FOUND, SERVICE_UNAVAILABLE, INTERNAL_ERROR]}
+            message: {type: string}
+            requestId: {type: string}
+  responses:
+    Error: {description: Error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+paths:
+  /tickets:
+    post:
+      summary: Create a ticket
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [title, description], properties: {title: {type: string}, description: {type: string}, priority: {$ref: '#/components/schemas/Priority'}, status: {$ref: '#/components/schemas/Status'}}}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/Ticket'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {description: Missing/invalid JWT (API Gateway)}
+    get:
+      summary: List own tickets (newest first)
+      parameters:
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/Status'}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+        - {name: nextToken, in: query, schema: {type: string}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Ticket'}}, nextToken: {type: string}}}}}}
+        '400': {$ref: '#/components/responses/Error'}
+  /tickets/{ticketId}:
+    parameters: [{name: ticketId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: Get a ticket
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Ticket'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+    patch:
+      summary: Update title, description, priority and/or status
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, minProperties: 1, properties: {title: {type: string}, description: {type: string}, priority: {$ref: '#/components/schemas/Priority'}, status: {$ref: '#/components/schemas/Status'}}}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Ticket'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+    delete:
+      summary: Delete a ticket
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/Error'}
+  /reports:
+    post:
+      summary: Request a CSV report of own tickets
+      requestBody:
+        required: false
+        content: {application/json: {schema: {type: object, properties: {status: {$ref: '#/components/schemas/Status'}}}}}
+      responses:
+        '202': {description: Accepted, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /reports/{reportId}:
+    parameters: [{name: reportId, in: path, required: true, schema: {type: string}}]
+    get:
+      summary: Report status (+ download link when COMPLETED)
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Report'}}}}
+        '404': {$ref: '#/components/responses/Error'}

@@ -1,0 +1,6 @@
+$kind: http-request
+url: "{{baseUrl}}/tickets?status=OPEN&limit=10"
+method: GET
+headers:
+  Content-Type: application/json
+order: 3000

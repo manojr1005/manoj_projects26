@@ -1,0 +1,18 @@
+$kind: http-request
+url: "{{baseUrl}}/reports"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "status": "OPEN"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      pm.test("202",()=>pm.response.to.have.status(202));
+      pm.collectionVariables.set("reportId", pm.response.json().reportId);
+    language: text/javascript
+order: 5000
